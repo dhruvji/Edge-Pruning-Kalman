@@ -66,7 +66,7 @@ sys.path.append(
         "src/modeling/"
     )
 )   # Very hacky but the imports are annoying otherwise
-from modeling_fpt2 import FPT2LMHeadModel
+from src.models.gpt2 import GPT2
 
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/text-classification/requirements.txt")
 logger = logging.getLogger(__name__)
@@ -124,7 +124,7 @@ class FPT2InfoTrainer(Seq2SeqTrainer):
         else:
             return self.target_layer_sparsity
 
-    def compute_loss(self, model, inputs, num_items_in_batch=None, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False):
         start_idxes = inputs.pop("start_idxes")
         end_idxes = inputs.pop("end_idxes")
         _ = inputs.pop("labels")
@@ -164,46 +164,33 @@ class FPT2InfoTrainer(Seq2SeqTrainer):
         reg_loss = reg_edge_loss + reg_layer_loss
         logits = outputs["logits"]
         
-        kl_loss = 0
-        for i in range(logits.shape[0]):
-            logits_i = nn.functional.log_softmax(logits[i, start_idxes[i]:end_idxes[i]], dim=-1)
-            logits_gpt2_i = nn.functional.log_softmax(logits_gpt2[i, start_idxes[i]:end_idxes[i]], dim=-1)
-            
-            kl_loss_component = nn.functional.kl_div(logits_i, logits_gpt2_i, reduction='batchmean', log_target=True)
-            kl_loss += kl_loss_component
-        kl_loss /= logits.shape[0]
+        logits_idx = torch.gather(
+            logits,
+            1,
+            start_idxes.reshape(-1, 1, 1).repeat(1, 1, logits.shape[-1])
+        ).squeeze() # (batch_size, num_labels)
+        logits_gpt2_idx = torch.gather(
+            logits_gpt2,
+            1,
+            start_idxes.reshape(-1, 1, 1).repeat(1, 1, logits_gpt2.shape[-1])
+        ).squeeze()
+
+        kl_loss = nn.functional.kl_div(
+            nn.functional.log_softmax(logits_idx, dim=-1),
+            nn.functional.softmax(logits_gpt2_idx, dim=-1),
+            reduction='batchmean',
+        )
         
         loss = kl_loss + reg_loss
         outputs["loss"] = loss
         outputs["kl_loss"] = kl_loss
-        matches = 0
-        for i in range(logits.shape[0]):
-            model_top = torch.argmax(logits[i, start_idxes[i]:end_idxes[i]].max(dim=-1)[0])
-            gpt2_top = torch.argmax(logits_gpt2[i, start_idxes[i]:end_idxes[i]].max(dim=-1)[0])
-            matches += (model_top == gpt2_top).float()
-        accuracy = matches / logits.shape[0]
-        
-        logs = {
-            "reg_loss":      float(reg_loss.item()),
-            "kl_loss":       float(kl_loss.item()),
-            "active_edges":  int(outputs["active_edges"].item()),
-            "total_edges":   int(outputs["total_edges"].item()),
-            "active_nodes":  int(outputs["active_nodes"].item()),
-            "total_nodes":   int(outputs["total_nodes"].item()),
-            "lambda_edges_1":float(outputs["lambda_edges_1"].item()),
-            "lambda_edges_2":float(outputs["lambda_edges_2"].item()),
-            "lambda_nodes_1":float(outputs["lambda_nodes_1"].item()),
-            "lambda_nodes_2":float(outputs["lambda_nodes_2"].item()),            
-            "accuracy":      float(accuracy.item()),
-        }
-        self.log(logs)
 
         return (loss, outputs) if return_outputs else loss
 
 @dataclass
 class DataTrainingArguments:
     dataset_path: Optional[str] = field(
-        default="./data/dataset/ioi/",
+        default="./data/identity-splits/",
         metadata={"help": "The path to the directory with the JSON files of the task."},
     )
     train_split: Optional[str] = field(
@@ -241,7 +228,7 @@ class DataTrainingArguments:
         metadata={"help": "The initial edge sparsity of the model."}
     )
     target_edge_sparsity: Optional[float] = field(
-        default=0.97,
+        default=0.99,
         metadata={"help": "The target edge sparsity of the model."}
     )
     start_layer_sparsity: Optional[float] = field(
@@ -249,7 +236,7 @@ class DataTrainingArguments:
         metadata={"help": "The initial layer sparsity of the model."}
     )
     target_layer_sparsity: Optional[float] = field(
-        default=0.72,
+        default=0.80,
         metadata={"help": "The target layer sparsity of the model."}
     )
     stop_optimizing_layer_if_higher_sparsity: Optional[bool] = field(
@@ -372,95 +359,12 @@ def load_datasets(dataset_path, max_train_samples, max_eval_samples, train_split
             dataset["validation"] = dataset["validation"].select(range(max_eval_samples))
     return dataset
 
-baba_templates = [
-    "Then, {B} and {A} went to the {PLACE}. {B} gave a {OBJECT} to {A}",
-    "Then, {B} and {A} had a lot of fun at the {PLACE}. {B} gave a {OBJECT} to {A}",
-    "Then, {B} and {A} were working at the {PLACE}. {B} decided to give a {OBJECT} to {A}",
-    "Then, {B} and {A} were thinking about going to the {PLACE}. {B} wanted to give a {OBJECT} to {A}",
-    "Then, {B} and {A} had a long argument, and afterwards {B} said to {A}",
-    "After {B} and {A} went to the {PLACE}, {B} gave a {OBJECT} to {A}",
-    "When {B} and {A} got a {OBJECT} at the {PLACE}, {B} decided to give it to {A}",
-    "When {B} and {A} got a {OBJECT} at the {PLACE}, {B} decided to give the {OBJECT} to {A}",
-    "While {B} and {A} were working at the {PLACE}, {B} gave a {OBJECT} to {A}",
-    "While {B} and {A} were commuting to the {PLACE}, {B} gave a {OBJECT} to {A}",
-    "After the lunch, {B} and {A} went to the {PLACE}. {B} gave a {OBJECT} to {A}",
-    "Afterwards, {B} and {A} went to the {PLACE}. {B} gave a {OBJECT} to {A}",
-    "Then, {B} and {A} had a long argument. Afterwards {B} said to {A}",
-    "The {PLACE} {B} and {A} went to had a {OBJECT}. {B} gave it to {A}",
-    "Friends {B} and {A} found a {OBJECT} at the {PLACE}. {B} gave it to {A}",
-]
-
-abba_templates = [
-    "Then, {A} and {B} went to the {PLACE}. {B} gave a {OBJECT} to {A}",
-    "Then, {A} and {B} had a lot of fun at the {PLACE}. {B} gave a {OBJECT} to {A}",
-    "Then, {A} and {B} were working at the {PLACE}. {B} decided to give a {OBJECT} to {A}",
-    "Then, {A} and {B} were thinking about going to the {PLACE}. {B} wanted to give a {OBJECT} to {A}",
-    "Then, {A} and {B} had a long argument, and afterwards {B} said to {A}",
-    "After {A} and {B} went to the {PLACE}, {B} gave a {OBJECT} to {A}",
-    "When {A} and {B} got a {OBJECT} at the {PLACE}, {B} decided to give it to {A}",
-    "When {A} and {B} got a {OBJECT} at the {PLACE}, {B} decided to give the {OBJECT} to {A}",
-    "While {A} and {B} were working at the {PLACE}, {B} gave a {OBJECT} to {A}",
-    "While {A} and {B} were commuting to the {PLACE}, {B} gave a {OBJECT} to {A}",
-    "After the lunch, {A} and {B} went to the {PLACE}. {B} gave a {OBJECT} to {A}",
-    "Afterwards, {A} and {B} went to the {PLACE}. {B} gave a {OBJECT} to {A}",
-    "Then, {A} and {B} had a long argument. Afterwards {B} said to {A}",
-    "The {PLACE} {A} and {B} went to had a {OBJECT}. {B} gave it to {A}",
-    "Friends {A} and {B} found a {OBJECT} at the {PLACE}. {B} gave it to {A}",
-]
-
-def try_fit_template(string, template):
-    pieces_s, pieces_t = string.strip(), template.strip()
-    
-    mapping = {}
-    
-    for s, t in zip(pieces_s.split(), pieces_t.split()):
-        if s == t:
-            continue
-        if s[-1] == t[-1] and s[-1] in [',', '.']:
-            s, t = s[:-1], t[:-1]
-        if t not in ['{A}', '{B}', '{PLACE}', '{OBJECT}']:
-            return None
-        elif t[1:-1].lower() in mapping:
-            if mapping[t[1:-1].lower()] != s:
-                return None
-        else:
-            mapping[t[1:-1].lower()] = s
-    
-    if 'place' not in mapping:
-        mapping['place'] = None
-    if 'object' not in mapping:
-        mapping['object'] = None
-    
-    return mapping
-
-def find_template(string):
-    for template in baba_templates:
-        mapping = try_fit_template(string, template)
-        if mapping is not None:
-            mapping.update({
-                'template': template,
-                'order': 'baba'
-            })
-            return mapping
-    
-    for template in abba_templates:
-        mapping = try_fit_template(string, template)
-        if mapping is not None:
-            mapping.update({
-                'template': template,
-                'order': 'abba'
-            })
-            return mapping
-    return None
-
-class DataCollatorIOI:
+class DataCollatorGP:
     def __init__(
         self, 
-        tokenizer,
-        max_length
+        max_length,
     ):
-        self.tokenizer = tokenizer
-        self.max_length = max_length
+        self.max_length = max_length 
 
     def __call__(self, examples):
         input_ids_all = []
@@ -469,77 +373,77 @@ class DataCollatorIOI:
         start_idxes = []
         end_idxes = []
         
-        key = "text" if "text" in examples[0] else "ioi_sentences"
-        
         for example in examples:
-            text = example[key]
-            corr_text = example["corr_"+key]
+            seq = example["sequence"]
+            corr_seq = example["corr_sequence"]
+            prediction = example["prediction"]
+            corr_prediction = example["corr_prediction"]
             
-            last_space = text.rfind(' ')
-            non_loss_portion = text[:last_space]
-            
-            len_non_loss = self.tokenizer(non_loss_portion, return_tensors="pt").input_ids.shape[1]
-            input_ids = self.tokenizer(text, return_tensors="pt", max_length=self.max_length, padding='max_length', truncation=True).input_ids[0]
-            corr_input_ids = self.tokenizer(corr_text, return_tensors="pt", max_length=self.max_length, padding='max_length', truncation=True).input_ids[0]
+            l = self.tokenizer(seq, return_tensors="pt")["input_ids"].shape[1]
+            input_ids = self.tokenizer(seq+" "+prediction, return_tensors="pt", padding="max_length", max_length=self.max_length)["input_ids"][0]
+            corr_input_ids = self.tokenizer(corr_seq+" "+corr_prediction, return_tensors="pt", padding="max_length", max_length=self.max_length)["input_ids"][0]
             labels = input_ids.clone()
-            labels[:len_non_loss] = -100
+            labels[:l] = -100
             labels[labels == self.tokenizer.pad_token_id] = -100
-            
+
             input_ids_all.append(input_ids)
             corr_input_ids_all.append(corr_input_ids)
             labels_all.append(labels)
             
             first_pad = (input_ids == self.tokenizer.pad_token_id).nonzero()[0]
-            start_idxes.append(len_non_loss-1)
+            start_idxes.append(l-1)
             end_idxes.append(first_pad-1)
         
-        batch = {
+        return {
             "input_ids": torch.stack(input_ids_all),
             "corr_input_ids": torch.stack(corr_input_ids_all),
             "labels": torch.stack(labels_all),
             "start_idxes": torch.LongTensor(start_idxes),
             "end_idxes": torch.LongTensor(end_idxes),
-        }
-
-        return batch     
+        }        
 
 def eval_fn(eval_pred): 
-    # logits, target_edge_sparsity, target_layer_sparsity, model_edge_sparsity, model_layer_sparsity, reg_edge_loss, reg_layer_loss, kl_loss = eval_pred.predictions
-    # if len(model_edge_sparsity.shape) > 0:
-    #     model_edge_sparsity = model_edge_sparsity[0].item()
-    #     model_layer_sparsity = model_layer_sparsity[0].item()
-    #     target_edge_sparsity = target_edge_sparsity[0].item()
-    #     target_layer_sparsity = target_layer_sparsity[0].item()
-    # else:
-    #     model_edge_sparsity = model_edge_sparsity.item()
-    #     model_layer_sparsity = model_layer_sparsity.item()
-    #     target_edge_sparsity = target_edge_sparsity.item()
-    #     target_layer_sparsity = target_layer_sparsity.item()
+    logits, target_edge_sparsity, target_layer_sparsity, model_edge_sparsity, model_layer_sparsity, reg_edge_loss, reg_layer_loss, kl_loss = eval_pred.predictions
+    if len(model_edge_sparsity.shape) > 0:
+        model_edge_sparsity = model_edge_sparsity[0].item()
+        model_layer_sparsity = model_layer_sparsity[0].item()
+        target_edge_sparsity = target_edge_sparsity[0].item()
+        target_layer_sparsity = target_layer_sparsity[0].item()
+    else:
+        model_edge_sparsity = model_edge_sparsity.item()
+        model_layer_sparsity = model_layer_sparsity.item()
+        target_edge_sparsity = target_edge_sparsity.item()
+        target_layer_sparsity = target_layer_sparsity.item()
     
-    # predictions = np.argmax(logits, axis=-1)[:, :-1]
-    # labels = eval_pred.label_ids[:, 1:]
+    predictions = np.argmax(logits, axis=-1)[:, :-1]
+    labels = eval_pred.label_ids[:, 1:]
 
-    # eval_mask = (labels != -100).astype(int)
-    # predictions = predictions * eval_mask
-    # labels = labels * eval_mask
+    eval_mask = (labels != -100).astype(int)
+    predictions = predictions * eval_mask
+    labels = labels * eval_mask
     
-    # correct = (predictions == labels).all(axis=1)
-    # accuracy = correct.sum().item() / correct.shape[0]
+    correct = (predictions == labels).all(axis=1)
+    accuracy = correct.sum().item() / correct.shape[0]
     
-    # kl_loss = kl_loss.mean().item()
-    # reg_edge_loss = reg_edge_loss.mean().item()
-    # reg_layer_loss = reg_layer_loss.mean().item()
+    kl_loss = kl_loss.mean().item()
+    reg_edge_loss = reg_edge_loss.mean().item()
+    reg_layer_loss = reg_layer_loss.mean().item()
     
     return {
-        # "eval_accuracy": accuracy,
-        # "model_edge_sparsity": model_edge_sparsity,
-        # "model_layer_sparsity": model_layer_sparsity,
-        # "target_edge_sparsity": target_edge_sparsity,
-        # "target_layer_sparsity": target_layer_sparsity,
-        # "eval_kl_loss": kl_loss,
-        # "eval_reg_edge_loss": reg_edge_loss,
-        # "eval_reg_layer_loss": reg_layer_loss,
+        "eval_accuracy": accuracy,
+        "model_edge_sparsity": model_edge_sparsity,
+        "model_layer_sparsity": model_layer_sparsity,
+        "target_edge_sparsity": target_edge_sparsity,
+        "target_layer_sparsity": target_layer_sparsity,
+        "eval_kl_loss": kl_loss,
+        "eval_reg_edge_loss": reg_edge_loss,
+        "eval_reg_layer_loss": reg_layer_loss,
     }
+
+@torch.no_grad()
+def load_avg_activations(model, path, device):
+    avg_activations = pickle.load(open(path, "rb"))
+    model.load_captured_activations(avg_activations.to(device))
     
 def freeze_all_except_pruning_params(model):
     for n, p in model.named_parameters():
@@ -680,12 +584,13 @@ def main():
         train_dataset = raw_datasets["train"]
 
     if training_args.do_eval:
+        # We don't have a validation dataset, so we'll just use the test dataset.
         if "validation" not in raw_datasets:
             raise ValueError("--do_eval requires a validation dataset")
         eval_dataset = raw_datasets["validation"]
 
     # Data collator
-    collator = DataCollatorIOI(
+    collator = DataCollatorGP(
         tokenizer=tokenizer,
         max_length=data_args.max_seq_length
     )
@@ -698,7 +603,7 @@ def main():
         reg_layers_lr=data_args.reg_layer_learning_rate,
         num_training_steps=training_args.max_steps,
         warmup_steps=training_args.warmup_steps,
-        disable_node_loss=data_args.disable_node_loss
+        disable_node_loss=data_args.disable_node_loss,
     )
 
     # Initialize our Trainer

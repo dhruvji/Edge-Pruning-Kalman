@@ -20,6 +20,7 @@ import os
 import warnings
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -46,10 +47,12 @@ from transformers.utils import (
 from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
 from l0 import deterministic_z_from_log_alpha, sample_z_from_log_alpha
 
+
 logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "openai-community/gpt2"
 _CONFIG_FOR_DOC = "GPT2Config"
+
 
 def writer_idx_to_name(writer_idx, num_layers, num_heads, with_embedding_nodes=False):
     if with_embedding_nodes:
@@ -813,6 +816,15 @@ class FPT2ModelOutput(ModelOutput):
     model_node_sparsity: Optional[torch.FloatTensor] = None
     edge_loss: Optional[torch.FloatTensor] = None
     node_loss: Optional[torch.FloatTensor] = None
+    
+    active_edges: Optional[torch.FloatTensor] = None
+    active_nodes: Optional[torch.FloatTensor] = None
+    total_edges: Optional[torch.FloatTensor] = None
+    total_nodes: Optional[torch.FloatTensor] = None
+    lambda_edges_1: Optional[torch.FloatTensor] = None
+    lambda_edges_2: Optional[torch.FloatTensor] = None
+    lambda_nodes_1: Optional[torch.FloatTensor] = None
+    lambda_nodes_2: Optional[torch.FloatTensor] = None
 
 class FPT2Model(FPT2PreTrainedModel):
     def __init__(
@@ -1433,6 +1445,14 @@ class FPT2Model(FPT2PreTrainedModel):
             model_node_sparsity=model_node_sparsity,
             edge_loss=edge_loss,
             node_loss=node_loss,
+            active_edges=torch.tensor(z_edges_sum.clone().detach().item()),
+            active_nodes=torch.tensor(z_nodes_sum.clone().detach().item()),
+            total_edges=torch.tensor(self.n_edges),
+            total_nodes=torch.tensor(self.n_nodes),
+            lambda_edges_1=torch.tensor(self.sparsity_lambda_edges_1.clone().detach().item()),
+            lambda_edges_2=torch.tensor(self.sparsity_lambda_edges_2.clone().detach().item()),
+            lambda_nodes_1=torch.tensor(self.sparsity_lambda_nodes_1.clone().detach().item()),
+            lambda_nodes_2=torch.tensor(self.sparsity_lambda_nodes_2.clone().detach().item()),
         )
 
 @dataclass 
@@ -1449,6 +1469,15 @@ class FPT2LMHeadModelOutput(ModelOutput):
     model_node_sparsity: Optional[torch.FloatTensor] = None
     edge_loss: Optional[torch.FloatTensor] = None
     node_loss: Optional[torch.FloatTensor] = None
+    
+    active_edges: Optional[torch.FloatTensor] = None
+    active_nodes: Optional[torch.FloatTensor] = None
+    total_edges: Optional[torch.FloatTensor] = None
+    total_nodes: Optional[torch.FloatTensor] = None
+    lambda_edges_1: Optional[torch.FloatTensor] = None
+    lambda_edges_2: Optional[torch.FloatTensor] = None
+    lambda_nodes_1: Optional[torch.FloatTensor] = None
+    lambda_nodes_2: Optional[torch.FloatTensor] = None
 
 class FPT2LMHeadModel(FPT2PreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
@@ -1672,6 +1701,14 @@ class FPT2LMHeadModel(FPT2PreTrainedModel):
             model_node_sparsity=transformer_outputs.model_node_sparsity,
             edge_loss=transformer_outputs.edge_loss,
             node_loss=transformer_outputs.node_loss,
+            active_edges=transformer_outputs.active_edges,
+            active_nodes=transformer_outputs.active_nodes,
+            total_edges=transformer_outputs.total_edges,
+            total_nodes=transformer_outputs.total_nodes,
+            lambda_edges_1=transformer_outputs.lambda_edges_1,
+            lambda_edges_2=transformer_outputs.lambda_edges_2,
+            lambda_nodes_1=transformer_outputs.lambda_nodes_1,
+            lambda_nodes_2=transformer_outputs.lambda_nodes_2,
         )
 
     @staticmethod
